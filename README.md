@@ -4,7 +4,8 @@ Get your laptop's [Buzz](https://buzz.xyz) notifications on your Android phone.
 
 Buzz doesn't have Android push notifications yet. AE Buzz fills the gap: a small Windows tray app
 watches the notifications Buzz desktop shows, and forwards them to an Android app through
-your own Firebase project.
+your own Firebase project. It works with both the original Buzz desktop app and the newer Buzz
+Foundation app; if both are open, each message is forwarded once.
 
 > Unofficial. Not affiliated with or endorsed by Block, Inc. or the Buzz project.
 

@@ -16,7 +16,7 @@ from winrt.windows.ui.notifications.management import (
     UserNotificationListenerAccessStatus,
 )
 
-from .toasts import BUZZ_AUMID, NewToastTracker, Toast, parse_toast
+from .toasts import BUZZ_AUMIDS, CrossAppDuplicateFilter, NewToastTracker, Toast, parse_toast
 
 log = logging.getLogger(__name__)
 
@@ -27,20 +27,22 @@ class AccessDenied(Exception):
     pass
 
 
-def _content_of(notification) -> Toast | None:
+def _content_of(notification, app: str) -> Toast | None:
     binding = notification.notification.visual.get_binding(KnownNotificationBindings.toast_generic)
     if binding is None:
         return None
-    return parse_toast(t.text for t in binding.get_text_elements())
+    return parse_toast((t.text for t in binding.get_text_elements()), app=app)
 
 
-async def _buzz_toasts(listener) -> list[tuple[int, Toast | None]]:
+async def _buzz_toasts(listener) -> list[tuple[tuple[str, int], Toast | None]]:
     toasts = []
     for n in await listener.get_notifications_async(NotificationKinds.TOAST):
         try:
-            if n.app_info.app_user_model_id != BUZZ_AUMID:
+            app = n.app_info.app_user_model_id
+            if app not in BUZZ_AUMIDS:
                 continue
-            toasts.append((n.id, _content_of(n)))
+            # Notification IDs are only unique per app, so key on both.
+            toasts.append(((app, n.id), _content_of(n, app)))
         except Exception:  # a single malformed toast must not stop the watcher
             log.exception("could not read toast")
     return toasts
@@ -79,10 +81,12 @@ class BuzzToastWatcher:
                 "Notifications > 'Let apps access your notifications'."
             )
         tracker = NewToastTracker()
+        duplicates = CrossAppDuplicateFilter()
         while not self._stop.is_set():
             try:
                 for toast in tracker.update(await _buzz_toasts(listener)):
-                    self._on_toast(toast)
+                    if duplicates.allow(toast):
+                        self._on_toast(toast)
             except Exception:
                 log.exception("poll failed")
             await asyncio.sleep(POLL_SECONDS)
