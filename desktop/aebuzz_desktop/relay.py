@@ -12,7 +12,7 @@ from typing import Callable
 import httpx
 
 from .config import Config
-from .toasts import Toast
+from .messages import Alert
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +26,12 @@ class NewPairing:
     desktop_secret: str
     qr_payload: str
     phone_url: str
+
+    def with_phone_url(self, url: str) -> "NewPairing":
+        """The same pairing, telling the phone to reach the server at `url` (e.g. a tunnel)."""
+        payload = json.loads(self.qr_payload)
+        payload["server"] = url
+        return NewPairing(self.pair_id, self.desktop_secret, json.dumps(payload, separators=(",", ":")), url)
 
 
 class RelayClient:
@@ -53,10 +59,10 @@ class RelayClient:
         r.raise_for_status()
         return r.json()
 
-    def notify(self, pair_id: str, secret: str, toast: Toast) -> int:
+    def notify(self, pair_id: str, secret: str, alert: Alert) -> int:
         r = self._http.post(
             f"/pairings/{pair_id}/notify",
-            json={"title": toast.title, "body": toast.body, "app": "Buzz", "ts": time.time()},
+            json={"title": alert.title, "body": alert.body, "app": "Buzz", "ts": time.time()},
             headers=_auth(secret),
         )
         return r.status_code
@@ -83,30 +89,30 @@ class Forwarder:
         self._client_factory = client_factory
         self._on_status = on_status
         self._on_unpaired = on_unpaired
-        self._queue: queue.Queue[Toast] = queue.Queue(maxsize=MAX_QUEUED)
+        self._queue: queue.Queue[Alert] = queue.Queue(maxsize=MAX_QUEUED)
         self._thread = threading.Thread(target=self._run, name="forwarder", daemon=True)
 
     def start(self) -> None:
         self._thread.start()
 
-    def submit(self, toast: Toast) -> None:
+    def submit(self, alert: Alert) -> None:
         if self._config.paused or not self._config.paired:
             return
         try:
-            self._queue.put_nowait(toast)
+            self._queue.put_nowait(alert)
         except queue.Full:
             log.warning("queue full, dropping notification")
 
     def _run(self) -> None:
         backoff = 1.0
         while True:
-            toast = self._queue.get()
+            alert = self._queue.get()
             while True:
                 cfg = self._config
                 if not cfg.paired:
                     break
                 try:
-                    code = self._client_factory(cfg.server_url).notify(cfg.pair_id, cfg.desktop_secret, toast)
+                    code = self._client_factory(cfg.server_url).notify(cfg.pair_id, cfg.desktop_secret, alert)
                 except httpx.HTTPError as exc:
                     code = None
                     self._on_status(f"Server unreachable, retrying ({type(exc).__name__})")

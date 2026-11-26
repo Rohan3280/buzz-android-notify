@@ -5,7 +5,7 @@ import httpx
 
 from aebuzz_desktop.config import Config
 from aebuzz_desktop.relay import Forwarder, RelayClient
-from aebuzz_desktop.toasts import Toast
+from aebuzz_desktop.messages import Alert
 
 
 def client_with(handler, base="http://127.0.0.1:8000"):
@@ -48,10 +48,10 @@ def test_config_roundtrip(tmp_path):
 def test_forwarder_skips_when_paused_or_unpaired():
     cfg = Config()
     f = Forwarder(cfg, lambda url: None, lambda s: None, lambda: None)
-    f.submit(Toast("x", None))
+    f.submit(Alert("x", None))
     assert f._queue.empty()
     cfg.pair_id, cfg.desktop_secret, cfg.paused = "p", "s", True
-    f.submit(Toast("x", None))
+    f.submit(Alert("x", None))
     assert f._queue.empty()
 
 
@@ -67,12 +67,25 @@ def test_forwarder_reports_unpaired_on_410():
 
     f = Forwarder(cfg, lambda url: client_with(handler), lambda s: None, done.set)
     f.start()
-    f.submit(Toast("Sooraj in #backend", "deploy failed"))
+    f.submit(Alert("Sam in #backend", "deploy failed"))
     assert done.wait(5)
-    assert seen == [("Sooraj in #backend", "deploy failed")]
+    assert seen == [("Sam in #backend", "deploy failed")]
 
 
 def test_config_with_bom_from_powershell(tmp_path):
     path = tmp_path / "config.json"
     path.write_bytes(b'\xef\xbb\xbf{"local_server_dir": "C:/srv"}')
     assert Config.load(path).local_server_dir == "C:/srv"
+
+
+def test_pairing_can_point_the_phone_at_a_tunnel():
+    import json
+
+    from aebuzz_desktop.relay import NewPairing
+
+    qr = json.dumps({"v": 1, "server": "http://127.0.0.1:8000", "pair": "p", "token": "t", "fb": {"x": "y"}})
+    moved = NewPairing("p", "s", qr, "http://127.0.0.1:8000").with_phone_url("https://a-b.trycloudflare.com")
+    assert moved.phone_url == "https://a-b.trycloudflare.com"
+    assert json.loads(moved.qr_payload) == {
+        "v": 1, "server": "https://a-b.trycloudflare.com", "pair": "p", "token": "t", "fb": {"x": "y"}
+    }

@@ -1,8 +1,10 @@
 """AE Buzz relay server: pairs a desktop agent with a phone and forwards notifications via FCM."""
 from __future__ import annotations
 
+import logging
 import os
 import secrets
+import threading
 import time
 from collections import defaultdict, deque
 from typing import Callable
@@ -13,6 +15,8 @@ from pydantic import BaseModel, Field
 from .db import Pairing, Store, secret_matches
 from .fcm import FirebaseSender, Sender, TokenGone
 from .firebase_config import load_app_options
+
+log = logging.getLogger(__name__)
 
 PAIR_TOKEN_TTL_SECONDS = 10 * 60
 RATE_LIMIT_PER_MINUTE = 60
@@ -63,6 +67,7 @@ def create_app(
     public_url: str | None = None,
     firebase_options: dict[str, str] | None = None,
     clock: Callable[[], float] = time.time,
+    warm_up: bool = False,
 ) -> FastAPI:
     store = store or Store(os.environ.get("AEBUZZ_DB", "aebuzz.db"))
     public_url = public_url if public_url is not None else os.environ.get("AEBUZZ_PUBLIC_URL")
@@ -74,11 +79,26 @@ def create_app(
         sender_holder["s"] = sender
     recent_sends: dict[str, deque[float]] = defaultdict(deque)
 
+    sender_lock = threading.Lock()
+
     def get_sender() -> Sender:
         # Lazy so the server starts (and tests run) without Firebase credentials.
-        if "s" not in sender_holder:
-            sender_holder["s"] = FirebaseSender()
-        return sender_holder["s"]
+        with sender_lock:
+            if "s" not in sender_holder:
+                sender_holder["s"] = FirebaseSender()
+            return sender_holder["s"]
+
+    def warm_up_sender() -> None:
+        try:
+            sender = get_sender()
+            if hasattr(sender, "warm_up"):
+                sender.warm_up()
+            log.info("connected to Firebase")
+        except Exception:
+            log.exception("could not connect to Firebase yet; will retry on the first notification")
+
+    if warm_up:
+        threading.Thread(target=warm_up_sender, name="firebase-warm-up", daemon=True).start()
 
     def load(pair_id: str) -> Pairing:
         pairing = store.get(pair_id)

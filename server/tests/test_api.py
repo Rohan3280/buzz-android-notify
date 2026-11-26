@@ -55,18 +55,18 @@ def test_full_flow_sends_title_and_body(env):
     p, _ = paired(client)
     r = client.post(
         f"/pairings/{p['pair_id']}/notify",
-        json={"title": "Sooraj in #backend", "body": "deploy failed"},
+        json={"title": "Sam in #backend", "body": "deploy failed"},
         headers=auth(p["desktop_secret"]),
     )
     assert r.status_code == 202
-    assert sender.sent == [("tok-1", "Sooraj in #backend", "deploy failed", "Buzz")]
+    assert sender.sent == [("tok-1", "Sam in #backend", "deploy failed", "Buzz")]
 
 
 def test_body_is_optional(env):
     client, sender, _ = env
     p, _ = paired(client)
-    client.post(f"/pairings/{p['pair_id']}/notify", json={"title": "Sooraj"}, headers=auth(p["desktop_secret"]))
-    assert sender.sent == [("tok-1", "Sooraj", None, "Buzz")]
+    client.post(f"/pairings/{p['pair_id']}/notify", json={"title": "Sam"}, headers=auth(p["desktop_secret"]))
+    assert sender.sent == [("tok-1", "Sam", None, "Buzz")]
 
 
 def test_notify_before_claim_is_conflict(env):
@@ -165,3 +165,26 @@ def test_secrets_are_not_stored_in_plaintext(env, tmp_path):
     raw = (tmp_path / "t.db").read_bytes()
     for secret in (p["desktop_secret"], phone_secret, p["pair_token"]):
         assert secret.encode() not in raw
+
+
+class WarmSender(FakeSender):
+    def __init__(self):
+        super().__init__()
+        import threading
+
+        self.warmed = threading.Event()
+
+    def warm_up(self):
+        self.warmed.set()
+
+
+def test_warm_up_connects_to_firebase_at_startup(tmp_path):
+    sender = WarmSender()
+    create_app(Store(str(tmp_path / "t.db")), sender, warm_up=True)
+    assert sender.warmed.wait(5)
+
+
+def test_no_warm_up_by_default(tmp_path):
+    sender = WarmSender()
+    create_app(Store(str(tmp_path / "t.db")), sender)
+    assert not sender.warmed.wait(0.2)

@@ -26,6 +26,13 @@ class FirebaseSender:
         if not firebase_admin._apps:
             firebase_admin.initialize_app()
 
+    def warm_up(self) -> None:
+        """Loads the messaging client and signs in to Google now, so the first send isn't slow."""
+        import firebase_admin
+        from firebase_admin import messaging  # noqa: F401  (the import itself takes seconds)
+
+        firebase_admin.get_app().credential.get_access_token()
+
     def send(self, fcm_token: str, title: str, body: str | None, app: str) -> None:
         from firebase_admin import messaging
 

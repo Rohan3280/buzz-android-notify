@@ -1,7 +1,8 @@
-"""AE Buzz tray app: watches Buzz toasts and forwards them to the paired phone.
+"""AE Buzz tray app: reads new Buzz messages from the Buzz server and forwards them to the paired phone.
 
 Threads: tkinter owns the main thread (pairing window); pystray runs its own
-thread; menu callbacks hand work to tkinter through a queue.
+thread; the Buzz feed runs its own thread; menu callbacks hand work to tkinter
+through a queue.
 """
 from __future__ import annotations
 
@@ -16,15 +17,36 @@ import pystray
 import qrcode
 from PIL import Image, ImageEnhance, ImageOps, ImageTk
 
+from .buzz_feed import BuzzFeed, FeedState
 from .config import Config, config_path
-from .listener import BuzzToastWatcher
 from .local_server import LocalServer
 from .relay import Forwarder, RelayClient
+from .tunnel import QuickTunnel, TunnelError, find_cloudflared, is_local_url
 
 log = logging.getLogger(__name__)
 
 APP_NAME = "AE Buzz"
 PAIR_POLL_MS = 2000
+
+# Tray status line while the Buzz connection isn't healthy (None = show the pairing status).
+FEED_STATUS = {
+    FeedState.CONNECTING: "Connecting to Buzz…",
+    FeedState.CONNECTED: None,
+    FeedState.UNREACHABLE: "Can't reach Buzz, retrying",
+    FeedState.NO_KEY: "No Buzz key — sign in to Buzz",
+    FeedState.NO_ADDRESS: "Buzz address not found",
+}
+# Problems only the user can fix also get a one-time dialog.
+FEED_DIALOG = {
+    FeedState.NO_KEY: (
+        "Couldn't find your Buzz key on this laptop. Sign in to the Buzz desktop app, "
+        "then restart AE Buzz."
+    ),
+    FeedState.NO_ADDRESS: (
+        "Couldn't find your Buzz server address. Open Buzz desktop once, or set "
+        "buzz_relay_url in config.json, then restart AE Buzz."
+    ),
+}
 
 
 ICON_PATH = Path(__file__).with_name("icon.png")
@@ -42,15 +64,17 @@ class TrayApp:
     def __init__(self) -> None:
         self.config = Config.load()
         self.status = "Paired · forwarding" if self.config.paired else "Not paired"
+        self.feed_status: str | None = FEED_STATUS[FeedState.CONNECTING]
         self._ui_tasks: queue.Queue = queue.Queue()
         self._root = tk.Tk()
         self._root.withdraw()
         self._pair_window: tk.Toplevel | None = None
+        self._tunnel: QuickTunnel | None = None
 
         self.local_server = LocalServer(self.config)
         self.forwarder = Forwarder(self.config, RelayClient, self._set_status, self._handle_unpaired)
-        self.watcher = BuzzToastWatcher(self.forwarder.submit, self._set_status)
-        self.icon = pystray.Icon(APP_NAME, _icon_image(self.config.paired), APP_NAME, self._menu())
+        self.feed = BuzzFeed(self.config.resolve_buzz_relay_url, self.forwarder.submit, self._set_feed_state)
+        self.icon =pystray.Icon(APP_NAME, _icon_image(self.config.paired), APP_NAME, self._menu())
 
     # ---- menu -----------------------------------------------------------
     def _menu(self) -> pystray.Menu:
@@ -70,7 +94,9 @@ class TrayApp:
         )
 
     def _status_line(self) -> str:
-        return "Paused" if self.config.paused and self.config.paired else self.status
+        if self.config.paused and self.config.paired:
+            return "Paused"
+        return self.feed_status or self.status
 
     def _refresh_icon(self) -> None:
         self.icon.icon = _icon_image(self.config.paired and not self.config.paused)
@@ -80,6 +106,12 @@ class TrayApp:
     def _set_status(self, text: str) -> None:
         self.status = text
         self._refresh_icon()
+
+    def _set_feed_state(self, state: FeedState) -> None:
+        self.feed_status = FEED_STATUS[state]
+        self._refresh_icon()
+        if state in FEED_DIALOG:
+            self._ui(lambda: self._show_message(FEED_DIALOG[state]))
 
     def _toggle_pause(self) -> None:
         self.config.paused = not self.config.paused
@@ -101,7 +133,8 @@ class TrayApp:
         self._set_status("Not paired")
 
     def _quit(self) -> None:
-        self.watcher.stop()
+        self.feed.stop()
+        self._stop_tunnel()
         self.local_server.stop()
         self.icon.stop()
         self._ui(self._root.quit)
@@ -133,33 +166,58 @@ class TrayApp:
         if self._pair_window is not None:
             self._pair_window.lift()
             return
-        try:
-            pairing = RelayClient(self.config.server_url).create_pairing()
-        except httpx.HTTPError as exc:
-            self._show_message(f"Can't reach the relay server at {self.config.server_url}.\n\n{exc}")
-            return
-
         win = tk.Toplevel(self._root)
         win.title(f"{APP_NAME} — pair your phone")
         win.resizable(False, False)
         win.attributes("-topmost", True)
         self._pair_window = win
         win.protocol("WM_DELETE_WINDOW", self._close_pair_window)
+        status = tk.Label(win, text="Getting a pairing code…", justify="center")
+        status.pack(padx=16, pady=16)
+        threading.Thread(
+            target=self._prepare_pairing, args=(win, status), name="pairing", daemon=True
+        ).start()
 
+    def _prepare_pairing(self, win: tk.Toplevel, status: tk.Label) -> None:
+        """Runs off the UI thread: creates the pairing, opening a tunnel if the phone needs one."""
+        server_url = self.config.server_url
+        warning = ""
+        try:
+            pairing = RelayClient(server_url).create_pairing()
+        except httpx.HTTPError as exc:
+            text = f"Can't reach the relay server at {server_url}.\n\n{exc}"  # exc is cleared after this block
+            self._ui(lambda: self._pairing_failed(win, status, text))
+            return
+        if is_local_url(pairing.phone_url):
+            self._ui(lambda: status.config(text="Opening a secure link for your phone…"))
+            tunnel = QuickTunnel(server_url)
+            self._tunnel = tunnel
+            try:
+                pairing = pairing.with_phone_url(tunnel.start())
+            except TunnelError as exc:
+                log.warning("pairing tunnel failed: %s", exc)
+                warning = f"\n\nWarning: couldn't open a link your phone can reach ({exc})."
+                if find_cloudflared() is None:
+                    warning += "\nInstall it with: winget install Cloudflare.cloudflared, then try again."
+                else:
+                    warning += "\nClose this window and choose Pair phone… again."
+        self._ui(lambda: self._show_pairing(win, status, pairing, warning))
+
+    def _pairing_failed(self, win: tk.Toplevel, status: tk.Label, text: str) -> None:
+        if self._pair_window is win:
+            status.config(text=text, justify="left", wraplength=420)
+
+    def _show_pairing(self, win: tk.Toplevel, status: tk.Label, pairing, warning: str) -> None:
+        if self._pair_window is not win:  # closed while we were getting the code ready
+            self._stop_tunnel()
+            return
         qr_img = qrcode.make(pairing.qr_payload, box_size=8, border=2).get_image()
         photo = ImageTk.PhotoImage(qr_img)
         label = tk.Label(win, image=photo)
         label.image = photo  # keep a reference or tkinter drops the image
-        label.pack(padx=16, pady=(16, 8))
-
-        hint = "Open AE Buzz on your phone and scan this code.\nIt expires in 10 minutes."
-        if pairing.phone_url.startswith(("http://127.", "http://localhost")):
-            hint += (
-                "\n\nWarning: the server has no public URL, so your phone can't reach it.\n"
-                "Set AEBUZZ_PUBLIC_URL on the server (e.g. a cloudflared tunnel URL)."
-            )
-        status = tk.Label(win, text=hint, justify="center")
-        status.pack(padx=16, pady=(0, 16))
+        label.pack(before=status, padx=16, pady=(16, 8))
+        status.config(text="Open AE Buzz on your phone and scan this code.\nIt expires in 10 minutes." + warning)
+        status.pack_configure(pady=(0, 16))
 
         def poll() -> None:
             if self._pair_window is not win:
@@ -185,6 +243,12 @@ class TrayApp:
         if self._pair_window is not None:
             self._pair_window.destroy()
             self._pair_window = None
+        self._stop_tunnel()
+
+    def _stop_tunnel(self) -> None:
+        if self._tunnel is not None:
+            self._tunnel.stop()
+            self._tunnel = None
 
     def _show_message(self, text: str) -> None:
         win = tk.Toplevel(self._root)
@@ -198,7 +262,7 @@ class TrayApp:
         threading.Thread(target=self.icon.run, name="tray", daemon=True).start()
         threading.Thread(target=self._start_local_server, name="local-server", daemon=True).start()
         self.forwarder.start()
-        self.watcher.start()
+        self.feed.start()
         self._root.after(200, self._drain_ui_tasks)
         self._root.mainloop()
 

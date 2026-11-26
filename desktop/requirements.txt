@@ -1,13 +1,12 @@
-winrt-runtime
-winrt-Windows.UI.Notifications.Management
-winrt-Windows.UI.Notifications
-winrt-Windows.Foundation
-winrt-Windows.Foundation.Collections
-winrt-Windows.ApplicationModel
+websockets
+coincurve
+cryptography
 pystray
 Pillow
 qrcode
 httpx
+# The relay server, which AE Buzz.exe bundles
+-r ../server/requirements.txt
 # tests and packaging
 pytest
 pyinstaller

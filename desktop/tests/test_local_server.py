@@ -19,3 +19,29 @@ def test_new_config_fields_roundtrip(tmp_path):
     Config(local_server_dir="C:/srv", firebase_key_path="C:/key.json").save(path)
     loaded = Config.load(path)
     assert loaded.local_server_dir == "C:/srv" and loaded.firebase_key_path == "C:/key.json"
+
+
+def test_bundled_exe_runs_its_own_server(monkeypatch, tmp_path):
+    import sys
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", "C:/Apps/AE Buzz.exe")
+    monkeypatch.setattr("aebuzz_desktop.local_server.config_path", lambda: tmp_path / "config.json")
+    server = LocalServer(Config(firebase_key_path="C:/key.json"))
+    assert server.enabled
+    assert server.command() == (["C:/Apps/AE Buzz.exe", "--relay-server"], tmp_path)
+
+
+def test_bundled_exe_without_firebase_key_hosts_nothing(monkeypatch):
+    import sys
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert not LocalServer(Config()).enabled
+
+
+def test_source_install_wins_when_configured(monkeypatch, tmp_path):
+    import sys
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    cfg = Config(local_server_dir=str(tmp_path), firebase_key_path="C:/key.json")
+    assert "not found" in LocalServer(cfg).command()
